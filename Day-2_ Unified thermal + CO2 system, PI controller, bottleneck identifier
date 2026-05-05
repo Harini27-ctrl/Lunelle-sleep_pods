@@ -1,0 +1,241 @@
+Lunelle Sleep Pod — Day 2
+==========================
+Unified thermal + CO2 regulation simulation.
+
+Day 2 additions over Day 1:
+    - CO2 simulation module (PI controller)
+    - Why PI and not P-only: P-only stabilizes at 1250 ppm, not 1000 ppm.
+      Minimum error to beat exhalation = 250 ppm → equilibrium at 1250 ppm.
+      Integral term eliminates this steady-state error.
+    - Baseline airflow guarantee (60 > 50 ppm/min exhalation)
+    - Integral windup prevention (reset on deactivation)
+    - Unified system: both modules running simultaneously
+    - AND safety logic: sleep-safe only when BOTH conditions met
+    - Bottleneck identified: CO2 oscillation breaks AND condition repeatedly
+
+Key finding from Day 2:
+    Temperature stabilizes quickly and stays within safe range.
+    CO2 repeatedly crosses the 1000 ppm threshold, breaking the AND
+    safety condition. CO2 is the system bottleneck — directs Day 3
+    engineering effort toward derivative control.
+
+Author: Lunelle Project
+Status: Day 2 Complete — unified thermal + CO2, PI control, bottleneck ID'd
+"""
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+
+# ─────────────────────────────────────────────
+# CONSTANTS
+# ─────────────────────────────────────────────
+
+# Thermal
+T0               = 37.0
+T_env            = 22.0
+T_target         = 36.0
+k_earth          = 0.05
+k_space          = 0.015
+kp_thermal       = 0.3
+metabolic_rate   = 0.008
+NOISE_STD        = 0.05
+MA_WINDOW        = 5
+STABILITY_DELTA  = 0.01
+TIMEOUT_LIMIT    = 15
+
+# CO2
+CO2_baseline     = 400     # ppm — fresh air
+CO2_exhalation   = 50      # ppm/min — continuous buildup from breathing
+CO2_safe_max     = 1000    # ppm — sleep-safe threshold
+baseline_airflow = 60      # ppm/min — minimum active airflow (must beat exhalation)
+kp_co2           = 0.2     # proportional gain
+ki_co2           = 0.01    # integral gain (small — prevents windup)
+
+
+# ─────────────────────────────────────────────
+# MODULE 1: THERMAL
+# ─────────────────────────────────────────────
+
+def simulate_thermal(duration=120, k=k_space, cooling=False):
+    """
+    Thermal regulation — same as Day 1, carried forward into unified system.
+    See Day 1 file for full documentation.
+    """
+    T = [T0]
+    time_above_target = 0
+
+    for t in range(1, duration):
+        current = T[-1]
+        window = T[-MA_WINDOW:] if len(T) >= MA_WINDOW else T
+        current_measured = np.mean(window) + np.random.normal(0, NOISE_STD)
+        delta = abs(T[-1] - T[-2]) if t > 1 else 0
+        dT = -k * (current - T_env) + metabolic_rate
+
+        if current_measured > T_target:
+            time_above_target += 1
+        else:
+            time_above_target = 0
+
+        if cooling and (
+            (current_measured > T_target and delta < STABILITY_DELTA)
+            or (time_above_target > TIMEOUT_LIMIT)
+        ):
+            dT -= kp_thermal * (current_measured - T_target)
+
+        T.append(current + dT)
+
+    return np.array(T)
+
+
+# ─────────────────────────────────────────────
+# MODULE 2: CO2 (PI CONTROLLER)
+# ─────────────────────────────────────────────
+
+def simulate_co2_pi(duration=120):
+    """
+    CO2 regulation using PI controller.
+
+    Why PI and not P-only:
+        P-only equilibrium = CO2_safe_max + (exhalation / kp)
+                           = 1000 + (50 / 0.2)
+                           = 1000 + 250 = 1250 ppm
+        Integral term eliminates this steady-state error.
+
+    Why baseline_airflow=60:
+        Guarantees airflow > exhalation (60 > 50) even at minimum error.
+        Without this, CO2 keeps rising when error is small.
+
+    Args:
+        duration (int): Simulation time in minutes
+
+    Returns:
+        list: CO2 concentration over time (ppm)
+    """
+    co2_levels = [CO2_baseline]
+    integral   = 0
+
+    for t in range(1, duration):
+        current = co2_levels[-1]
+
+        if current > CO2_safe_max:
+            error     = current - CO2_safe_max
+            integral += error
+            airflow   = baseline_airflow + kp_co2 * error + ki_co2 * integral
+        else:
+            airflow  = 0
+            integral = 0   # reset — prevents windup when inactive
+
+        new_co2 = max(current + CO2_exhalation - airflow, CO2_baseline)
+        co2_levels.append(new_co2)
+
+    return co2_levels
+
+
+# ─────────────────────────────────────────────
+# MODULE 3: UNIFIED SYSTEM
+# ─────────────────────────────────────────────
+
+def lunelle_combined(duration=120):
+    """
+    Unified Lunelle system — thermal + CO2 simultaneously.
+
+    AND safety logic:
+        sleep_safe = (temp <= T_target) AND (co2 <= CO2_safe_max)
+        Rationale: sleep safety is a hard constraint. Either variable
+        out of range means physiology is stressed.
+
+    Returns:
+        tuple: (temps, co2_levels, sleep_safe)
+    """
+    temps        = [T0]
+    co2_levels   = [CO2_baseline]
+    sleep_safe   = []
+    integral     = 0
+    time_above   = 0
+
+    for t in range(1, duration):
+
+        # ── Thermal ──
+        current_temp = temps[-1]
+        window = temps[-MA_WINDOW:] if len(temps) >= MA_WINDOW else temps
+        tm = np.mean(window) + np.random.normal(0, NOISE_STD)
+        delta = abs(temps[-1] - temps[-2]) if t > 1 else 0
+        dT = -k_space * (current_temp - T_env) + metabolic_rate
+        time_above = time_above + 1 if tm > T_target else 0
+        if (tm > T_target and delta < STABILITY_DELTA) or time_above > TIMEOUT_LIMIT:
+            dT -= kp_thermal * (tm - T_target)
+        temps.append(current_temp + dT)
+
+        # ── CO2 (PI) ──
+        current_co2 = co2_levels[-1]
+        if current_co2 > CO2_safe_max:
+            error     = current_co2 - CO2_safe_max
+            integral += error
+            airflow   = baseline_airflow + kp_co2 * error + ki_co2 * integral
+        else:
+            airflow  = 0
+            integral = 0
+        co2_levels.append(max(current_co2 + CO2_exhalation - airflow, CO2_baseline))
+
+        # ── AND safety gate ──
+        sleep_safe.append(temps[-1] <= T_target and co2_levels[-1] <= CO2_safe_max)
+
+    return temps, co2_levels, sleep_safe
+
+
+# ─────────────────────────────────────────────
+# PLOTS
+# ─────────────────────────────────────────────
+
+def plot_co2(duration=120):
+    co2_raw = [CO2_baseline]
+    for _ in range(1, duration):
+        co2_raw.append(min(co2_raw[-1] + CO2_exhalation, 3000))
+    co2_pi = simulate_co2_pi(duration)
+
+    plt.figure(figsize=(11, 6))
+    plt.plot(range(duration), co2_raw, label="No Intervention", linewidth=2)
+    plt.plot(range(duration), co2_pi,  label="Lunelle PI Control", linewidth=2)
+    plt.axhline(CO2_safe_max, linestyle='--', color='red',
+                label=f"Safe Threshold ({CO2_safe_max} ppm)")
+    plt.xlabel("Time (minutes)"); plt.ylabel("CO2 (ppm)")
+    plt.title("Lunelle Day 2 — CO2 Regulation (PI Controller)")
+    plt.legend(); plt.grid(alpha=0.3); plt.tight_layout(); plt.show()
+
+
+def plot_unified(duration=120):
+    temps, co2, safe = lunelle_combined(duration)
+    fig, (ax1, ax3) = plt.subplots(2, 1, figsize=(12, 9))
+    ax1.plot(range(len(temps)), temps, color="#E05C5C", linewidth=2, label="Temp (°C)")
+    ax1.axhline(T_target, linestyle='--', color="#E05C5C", alpha=0.5)
+    ax2 = ax1.twinx()
+    ax2.plot(range(len(co2)), co2, color="#5C8FE0", linewidth=2, label="CO2 (ppm)")
+    ax2.axhline(CO2_safe_max, linestyle='--', color="#5C8FE0", alpha=0.5)
+    for i in range(len(safe)):
+        if safe[i]: ax1.axvspan(i, i+1, alpha=0.15, color='green')
+    ax1.set_title("Lunelle Day 2 — Unified System (Green = Sleep Safe)")
+    ax1.set_ylabel("Temperature (°C)", color="#E05C5C")
+    ax2.set_ylabel("CO2 (ppm)", color="#5C8FE0")
+    ax1.grid(alpha=0.3)
+    safe_int = [1 if s else 0 for s in safe]
+    ax3.fill_between(range(len(safe)), safe_int, alpha=0.5, color='green', label="Safe")
+    ax3.fill_between(range(len(safe)), [1-s for s in safe_int], alpha=0.3, color='red', label="Unsafe")
+    ax3.set_yticks([0,1]); ax3.set_yticklabels(["Unsafe","Safe"])
+    ax3.set_title("Sleep-Safe Status (AND Logic)"); ax3.legend(); ax3.grid(alpha=0.3)
+    plt.tight_layout(); plt.show()
+
+
+# ─────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────
+
+if __name__ == "__main__":
+    print("Lunelle Day 2 — Unified Thermal + CO2 System")
+    temps, co2, safe = lunelle_combined()
+    pct = round(sum(safe) / len(safe) * 100, 1)
+    print(f"  Sleep-safe: {sum(safe)}/{len(safe)} min ({pct}%)")
+    print(f"  Bottleneck: CO2 oscillation breaks AND condition")
+    plot_co2()
+    plot_unified()
+    print("Done. Next: Day 3 — PID upgrade for CO2.")
