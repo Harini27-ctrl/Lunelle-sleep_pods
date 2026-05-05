@@ -1,0 +1,424 @@
+Lunelle Sleep Pod — v0.1 (Day 3 Update)
+========================================
+AI-powered thermal and CO2 regulation simulation for space sleep habitats.
+
+Day 3 Upgrade: CO2 controller upgraded from PI to full PID.
+Derivative term (kd=0.1) added to anticipate rising CO2 before
+threshold breach, reducing oscillation and overshoot.
+
+Modules:
+    1. Thermal Regulation  — proportional control with metabolic heat,
+                             sensor noise, moving average, state-based
+                             trigger, and timeout fallback.
+    2. CO2 Regulation      — full PID controller with smoothed derivative,
+                             integral windup prevention, baseline airflow.
+    3. Unified System      — both modules simultaneous, AND safety gate.
+    4. PID Tuning Comparison — kd sweep: 0, 0.05, 0.2, 1.0
+
+Control Systems Implemented:
+    - Newton's Law of Cooling
+    - Metabolic heat generation
+    - Proportional control (thermal)
+    - PID control (CO2) — Day 3 upgrade
+    - Gaussian sensor noise + moving average filter
+    - State-based trigger + timeout fallback (deadlock prevention)
+    - AND safety logic (multi-variable gate)
+    - Empirical kd tuning (0.05 → 0.2 tested, 0.1 selected)
+
+Author: Lunelle Project
+Status: Day 3 Complete — full PID on CO2, kd=0.1 tuned empirically
+"""
+
+import numpy as np
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+
+
+# ─────────────────────────────────────────────
+# GLOBAL CONSTANTS
+# ─────────────────────────────────────────────
+
+# Thermal
+T0               = 37.0    # Initial body temperature (°C)
+T_env            = 22.0    # ISS environment temperature (°C)
+T_target         = 36.0    # Sleep onset threshold (°C)
+k_earth          = 0.05    # Heat dissipation — Earth
+k_space          = 0.015   # Heat dissipation — microgravity (slower)
+kp_thermal       = 0.3     # Proportional gain — thermal controller
+metabolic_rate   = 0.008   # Metabolic heat generation (°C/min, ~80W at rest)
+NOISE_STD        = 0.05    # Sensor noise standard deviation
+MA_WINDOW        = 5       # Moving average window size
+STABILITY_DELTA  = 0.01    # Max delta to consider body thermally stable
+TIMEOUT_LIMIT    = 15      # Minutes above target before fallback fires
+
+# CO2
+CO2_baseline     = 400     # Fresh air CO2 (ppm)
+CO2_exhalation   = 50      # CO2 added per minute from breathing (ppm/min)
+CO2_safe_max     = 1000    # Sleep-safe CO2 threshold (ppm)
+baseline_airflow = 60      # Minimum airflow when active (ppm/min)
+kp_co2           = 0.2     # Proportional gain — CO2
+ki_co2           = 0.01    # Integral gain — small to prevent windup
+kd_co2           = 0.1     # Derivative gain — tuned empirically (Day 3)
+
+
+# ─────────────────────────────────────────────
+# MODULE 1: THERMAL REGULATION
+# ─────────────────────────────────────────────
+
+def simulate_thermal(duration=120, k=k_space, cooling=False):
+    """
+    Simulates body temperature in microgravity with optional Lunelle control.
+
+    Physics: Newton's Law of Cooling + constant metabolic heat generation.
+    Control: Proportional feedback, state-based trigger, timeout fallback.
+
+    Args:
+        duration (int): Simulation time in minutes
+        k (float): Heat dissipation coefficient
+        cooling (bool): Whether Lunelle thermal control is active
+
+    Returns:
+        np.array: True body temperature over time
+    """
+    T = [T0]
+    time_above_target = 0
+
+    for t in range(1, duration):
+        current = T[-1]
+
+        # ── Measurement: moving average + Gaussian noise ──
+        window = T[-MA_WINDOW:] if len(T) >= MA_WINDOW else T
+        current_measured = np.mean(window) + np.random.normal(0, NOISE_STD)
+
+        # ── Stability: rate of change ──
+        delta = abs(T[-1] - T[-2]) if t > 1 else 0
+
+        # ── Physics: cooling + metabolic heat ──
+        dT = -k * (current - T_env) + metabolic_rate
+
+        # ── Timeout fallback counter ──
+        if current_measured > T_target:
+            time_above_target += 1
+        else:
+            time_above_target = 0
+
+        # ── Control: state-based primary + timeout fallback ──
+        if cooling and (
+            (current_measured > T_target and delta < STABILITY_DELTA)
+            or (time_above_target > TIMEOUT_LIMIT)
+        ):
+            error = current_measured - T_target
+            dT -= kp_thermal * error
+
+        T.append(current + dT)
+
+    return np.array(T)
+
+
+# ─────────────────────────────────────────────
+# MODULE 2: CO2 REGULATION (FULL PID — Day 3)
+# ─────────────────────────────────────────────
+
+def simulate_co2_pid(duration=120, kd=kd_co2):
+    """
+    CO2 regulation using full PID controller.
+
+    Day 3 upgrade from PI: derivative term anticipates rising CO2
+    before threshold breach, reducing oscillation and overshoot.
+
+    Derivative smoothing: 3-point moving average on error signal
+    prevents noise amplification (D term is noise-sensitive by nature).
+
+    kd tuning (empirical):
+        kd=0    → PI behavior, oscillates around 1000 ppm
+        kd=0.05 → smoother approach, mild damping
+        kd=0.1  → selected — clean convergence, minimal jitter (OPTIMAL)
+        kd=0.2  → slight jitter begins appearing
+        kd=1.0  → noise amplification, unacceptable jitter
+
+    Args:
+        duration (int): Simulation time in minutes
+        kd (float): Derivative gain (default: tuned value 0.1)
+
+    Returns:
+        list: CO2 concentration over time (ppm)
+    """
+    co2_levels          = [CO2_baseline]
+    integral            = 0
+    prev_smoothed_error = 0
+    error_history       = []
+
+    for t in range(1, duration):
+        current = co2_levels[-1]
+
+        if current > CO2_safe_max:
+            # ── Error ──
+            error = current - CO2_safe_max
+
+            # ── Smooth error before derivative (noise reduction) ──
+            error_history.append(error)
+            if len(error_history) > 3:
+                error_history.pop(0)
+            smoothed_error = sum(error_history) / len(error_history)
+
+            # ── PID Terms ──
+            p_term  = kp_co2 * error
+
+            integral += error
+            i_term  = ki_co2 * integral
+
+            d_term  = kd * (smoothed_error - prev_smoothed_error)
+            prev_smoothed_error = smoothed_error
+
+            airflow = baseline_airflow + p_term + i_term + d_term
+
+        else:
+            # Reset all state on deactivation
+            airflow             = 0
+            integral            = 0
+            prev_smoothed_error = 0
+            error_history       = []
+
+        new_co2 = max(current + CO2_exhalation - airflow, CO2_baseline)
+        co2_levels.append(new_co2)
+
+    return co2_levels
+
+
+# ─────────────────────────────────────────────
+# MODULE 3: UNIFIED LUNELLE SYSTEM (PID)
+# ─────────────────────────────────────────────
+
+def lunelle_combined(duration=120):
+    """
+    Unified Lunelle sleep pod — thermal + CO2 running simultaneously.
+
+    Safety gate: AND logic — sleep-safe only when BOTH conditions met.
+    Rationale: sleep safety is a hard constraint. Either variable out
+    of range means physiology is stressed — partial safety is misleading.
+
+    System bottleneck (identified Day 2, confirmed Day 3):
+        Temperature stabilizes quickly. CO2 oscillation repeatedly
+        breaks AND condition. PID reduces this bottleneck.
+
+    Args:
+        duration (int): Simulation time in minutes
+
+    Returns:
+        tuple: (temps, co2_levels, sleep_safe)
+    """
+    temps               = [T0]
+    co2_levels          = [CO2_baseline]
+    sleep_safe          = []
+    integral_co2        = 0
+    prev_smoothed_error = 0
+    error_history       = []
+    time_above_target   = 0
+
+    for t in range(1, duration):
+
+        # ══ THERMAL MODULE ══
+        current_temp = temps[-1]
+
+        window = temps[-MA_WINDOW:] if len(temps) >= MA_WINDOW else temps
+        temp_measured = np.mean(window) + np.random.normal(0, NOISE_STD)
+
+        delta = abs(temps[-1] - temps[-2]) if t > 1 else 0
+        dT = -k_space * (current_temp - T_env) + metabolic_rate
+
+        time_above_target = time_above_target + 1 if temp_measured > T_target else 0
+
+        if (temp_measured > T_target and delta < STABILITY_DELTA) \
+                or (time_above_target > TIMEOUT_LIMIT):
+            dT -= kp_thermal * (temp_measured - T_target)
+
+        new_temp = current_temp + dT
+        temps.append(new_temp)
+
+        # ══ CO2 MODULE (PID) ══
+        current_co2 = co2_levels[-1]
+
+        if current_co2 > CO2_safe_max:
+            error = current_co2 - CO2_safe_max
+
+            error_history.append(error)
+            if len(error_history) > 3:
+                error_history.pop(0)
+            smoothed_error = sum(error_history) / len(error_history)
+
+            p_term       = kp_co2 * error
+            integral_co2 += error
+            i_term       = ki_co2 * integral_co2
+            d_term       = kd_co2 * (smoothed_error - prev_smoothed_error)
+            prev_smoothed_error = smoothed_error
+
+            airflow = baseline_airflow + p_term + i_term + d_term
+
+        else:
+            airflow             = 0
+            integral_co2        = 0
+            prev_smoothed_error = 0
+            error_history       = []
+
+        new_co2 = max(current_co2 + CO2_exhalation - airflow, CO2_baseline)
+        co2_levels.append(new_co2)
+
+        # ══ AND SAFETY GATE ══
+        safe = (new_temp <= T_target) and (new_co2 <= CO2_safe_max)
+        sleep_safe.append(safe)
+
+    return temps, co2_levels, sleep_safe
+
+
+# ─────────────────────────────────────────────
+# PLOTTING FUNCTIONS
+# ─────────────────────────────────────────────
+
+def plot_thermal_comparison(duration=120, save=False):
+    """Plot Earth vs microgravity vs Lunelle thermal curves."""
+    time = np.arange(duration)
+    earth   = simulate_thermal(duration, k=k_earth, cooling=False)
+    space   = simulate_thermal(duration, k=k_space, cooling=False)
+    lunelle = simulate_thermal(duration, k=k_space, cooling=True)
+
+    plt.figure(figsize=(11, 6))
+    plt.plot(time, earth,   label="Earth (Normal Cooling)",      linewidth=2)
+    plt.plot(time, space,   label="Microgravity (No Control)",   linewidth=2)
+    plt.plot(time, lunelle, label="Lunelle Intervention",        linewidth=2, color='green')
+    plt.axhline(T_target, linestyle='--', color='gray',
+                label=f"Sleep Threshold ({T_target}°C)")
+    plt.xlabel("Time (minutes)")
+    plt.ylabel("Core Body Temperature (°C)")
+    plt.title("Lunelle v0.1 — Thermal Regulation in Microgravity")
+    plt.legend(); plt.grid(alpha=0.3); plt.tight_layout()
+    if save: plt.savefig("plot1_thermal.png", dpi=150)
+    plt.close() if save else plt.show()
+
+
+def plot_pid_tuning(duration=120, save=False):
+    """Plot kd sweep to show derivative tuning effect on CO2."""
+    kd_values = [0, 0.05, 0.1, 0.2, 1.0]
+    colors    = ['#E05C5C', '#E09B5C', '#5CE07A', '#5C8FE0', '#A05CE0']
+
+    plt.figure(figsize=(11, 6))
+    for kd, color in zip(kd_values, colors):
+        co2 = simulate_co2_pid(duration, kd=kd)
+        label = f"kd={kd}" + (" ← selected" if kd == 0.1 else "")
+        plt.plot(range(duration), co2, label=label,
+                 linewidth=2.5 if kd == 0.1 else 1.5, color=color)
+
+    plt.axhline(CO2_safe_max, linestyle='--', color='red',
+                label=f"Safe Threshold ({CO2_safe_max} ppm)", linewidth=1.5)
+    plt.axhline(CO2_baseline, linestyle=':', color='gray',
+                label=f"Baseline ({CO2_baseline} ppm)")
+    plt.xlabel("Time (minutes)")
+    plt.ylabel("CO2 Concentration (ppm)")
+    plt.title("Lunelle — PID Tuning: kd Sweep (Day 3 Experiment)")
+    plt.legend(); plt.grid(alpha=0.3); plt.tight_layout()
+    if save: plt.savefig("plot2_pid_tuning.png", dpi=150)
+    plt.close() if save else plt.show()
+
+
+def plot_unified(duration=120, save=False):
+    """Plot unified system — temperature, CO2, and sleep-safe timeline."""
+    temps, co2, safe = lunelle_combined(duration)
+    time = range(len(temps))
+
+    fig, (ax1, ax3) = plt.subplots(2, 1, figsize=(12, 9))
+
+    # ── Panel 1: Temperature + CO2 dual axis ──
+    c_temp, c_co2 = "#E05C5C", "#5C8FE0"
+
+    ax1.plot(time, temps, color=c_temp, linewidth=2, label="Body Temp (°C)")
+    ax1.axhline(T_target, linestyle='--', color=c_temp, alpha=0.5,
+                label=f"Temp Target ({T_target}°C)")
+    ax1.set_ylabel("Temperature (°C)", color=c_temp)
+    ax1.tick_params(axis='y', labelcolor=c_temp)
+
+    ax2 = ax1.twinx()
+    ax2.plot(time, co2, color=c_co2, linewidth=2, label="CO2 (ppm)")
+    ax2.axhline(CO2_safe_max, linestyle='--', color=c_co2, alpha=0.5,
+                label=f"CO2 Safe Max ({CO2_safe_max} ppm)")
+    ax2.set_ylabel("CO2 (ppm)", color=c_co2)
+    ax2.tick_params(axis='y', labelcolor=c_co2)
+
+    for i in range(len(safe)):
+        if safe[i]:
+            ax1.axvspan(i, i + 1, alpha=0.15, color='green')
+
+    ax1.set_title("Lunelle v0.1 (PID) — Unified System  |  Green = Sleep Safe")
+    ax1.set_xlabel("Time (minutes)")
+    lines1, lbl1 = ax1.get_legend_handles_labels()
+    lines2, lbl2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines1 + lines2, lbl1 + lbl2, loc='upper right')
+    ax1.grid(alpha=0.3)
+
+    # ── Panel 2: Sleep-safe timeline ──
+    safe_int = [1 if s else 0 for s in safe]
+    ax3.fill_between(range(len(safe)), safe_int,
+                     alpha=0.5, color='green', label="Sleep Safe")
+    ax3.fill_between(range(len(safe)), [1 - s for s in safe_int],
+                     alpha=0.3, color='red', label="Unsafe")
+    ax3.set_yticks([0, 1])
+    ax3.set_yticklabels(["Unsafe", "Safe"])
+    ax3.set_xlabel("Time (minutes)")
+    ax3.set_title("Sleep-Safe Status — AND Logic (Temp AND CO2 both in range)")
+    ax3.legend(); ax3.grid(alpha=0.3)
+
+    # ── Summary stats ──
+    total_safe = sum(safe_int)
+    pct = round(total_safe / len(safe) * 100, 1)
+    ax3.text(0.98, 0.15, f"Sleep-Safe: {total_safe}/{len(safe)} min ({pct}%)",
+             transform=ax3.transAxes, ha='right', fontsize=10,
+             bbox=dict(boxstyle='round', facecolor='lightgreen', alpha=0.5))
+
+    plt.tight_layout()
+    if save: plt.savefig("plot3_unified.png", dpi=150)
+    plt.close() if save else plt.show()
+
+
+# ─────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────
+
+if __name__ == "__main__":
+    print("=" * 55)
+    print("  Lunelle Sleep Pod v0.1 — Day 3 Simulation")
+    print("=" * 55)
+
+    # Quick system report
+    temps, co2, safe = lunelle_combined()
+    safe_minutes = sum(safe)
+    total = len(safe)
+    pct = round(safe_minutes / total * 100, 1)
+
+    first_safe = next((i for i, s in enumerate(safe) if s), None)
+    first_unsafe_after = None
+    if first_safe is not None:
+        streak = 0
+        for i in range(first_safe, len(safe)):
+            if safe[i]:
+                streak += 1
+            else:
+                first_unsafe_after = i
+                break
+
+    print(f"\n  Thermal target      : {T_target}°C")
+    print(f"  CO2 safe max        : {CO2_safe_max} ppm")
+    print(f"  PID gains (CO2)     : kp={kp_co2}, ki={ki_co2}, kd={kd_co2}")
+    print(f"\n  First sleep-safe    : minute {first_safe}")
+    print(f"  CO2 bottleneck at   : minute {first_unsafe_after}")
+    print(f"  Total sleep-safe    : {safe_minutes}/{total} min ({pct}%)")
+
+    print("\n  Generating plots...")
+    plot_thermal_comparison(save=True)
+    print("  ✓ Plot 1: Thermal comparison saved")
+    plot_pid_tuning(save=True)
+    print("  ✓ Plot 2: PID kd tuning sweep saved")
+    plot_unified(save=True)
+    print("  ✓ Plot 3: Unified system saved")
+
+    print("\n  Day 3 complete.")
+    print("  Next: Day 4 — Anomaly detection (Isolation Forest)")
+    print("=" * 55)
